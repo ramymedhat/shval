@@ -61,6 +61,11 @@ inline double _relerr(double v, double x)
     return ((x == 0.0) ? (v == 0.0 ? 0.0 : 1.0) : (fabs((double)x-v) / fabs(x)));
 }
 
+inline double _abserr(double v, double x)
+{
+	    return fabs(x-v);
+}
+
 // native64 only: must match exactly or both be NaNs
 //
 inline bool _iserr(double v, double x)
@@ -73,7 +78,7 @@ inline bool _iserr(double v, double x)
 }
 
 #define SH_RELERR(V,X)  (_relerr((V),(X)))
+#define SH_ABSERR(V,X)  (_abserr((V),(X)))
 #define SH_ISERR(V,X)   (_iserr((V),(X)))
 
 #include "shval.cpp"
-

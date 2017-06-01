@@ -54,7 +54,7 @@
 
 #define SH_DBL(V)       (0.0)
 #define SH_RELERR(V,X)  (0.0)
+#define SH_ABSERR(V,X)  (0.0)
 #define SH_ISERR(V,X)   (false)
 
 #include "shval.cpp"
-

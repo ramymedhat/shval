@@ -72,6 +72,11 @@ inline double _relerr(float v, double x)
     return ((x == 0.0) ? (v == 0.0f ? 0.0 : 1.0) : (fabs((double)x-v) / fabs(x)));
 }
 
+inline double _abserr(float v, double x)
+{
+	    return fabs((double)x-v);
+}
+
 inline bool _iserr(float v, double x)
 {
     bool vnan = isnan(v);
@@ -82,7 +87,7 @@ inline bool _iserr(float v, double x)
 }
 
 #define SH_RELERR(V,X)  (_relerr((V),(X)))
+#define SH_ABSERR(V,X)  (_abserr((V),(X)))
 #define SH_ISERR(V,X)   (_iserr((V),(X)))
 
 #include "shval.cpp"
-

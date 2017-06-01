@@ -25,7 +25,8 @@
 
 # should point to Pin installation
 #PIN_ROOT="$HOME/opt/pin-3.0-76991-gcc-linux"
-PIN_ROOT="$HOME/opt/pin-2.14-71313-gcc.4.4.7-linux"
+#PIN_ROOT="$HOME/opt/pin-2.14-71313-gcc.4.4.7-linux"
+PIN_ROOT="$HOME/opt/pin-3.2-81205-gcc-linux"
 
 # create output folder
 mkdir -p obj-intel64

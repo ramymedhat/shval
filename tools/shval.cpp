@@ -145,6 +145,7 @@
 #include <sstream>
 #include <set>
 #include <unordered_map>
+#include <list>
 using namespace std;
 
 /*
@@ -191,6 +192,7 @@ extern "C" {
  */
 #define ENABLE_OVERWRITE_LOGGING 0
 
+
 /*
  * command-line options (uses Pin's "knob" interface)
  */
@@ -210,6 +212,17 @@ KNOB<bool>   KnobOnlineCheckRegs(KNOB_MODE_WRITEONCE, "pintool",
         "C", "0", "check values online, including registers (VERY expensive!) (default=0)");
 KNOB<UINT64> KnobMaximumErrors(KNOB_MODE_WRITEONCE, "pintool",
         "m", "1000", "maximum online errors to report before aborting (default=1000)");
+KNOB<INT64> KnobSamplingFrequency(KNOB_MODE_WRITEONCE, "pintool",
+        "l", "0", "sampling frequency for relative errors (default=0 aka Off)");
+KNOB<bool>   KnobTrackMemErrors(KNOB_MODE_WRITEONCE, "pintool",
+        "e", "0", "record relative error for every memory location");
+KNOB<bool>   KnobTrackInsErrors(KNOB_MODE_WRITEONCE, "pintool",
+        "i", "0", "record relative error for every instruction");
+KNOB<bool>   KnobResetErrors(KNOB_MODE_WRITEONCE, "pintool",
+        "r", "0", "reset error on function entry");
+KNOB<string> KnobFunctionsFile(KNOB_MODE_WRITEONCE, "pintool",
+        "F", DEFAULT_OUT_FN, "file containing names of functions to reset error upon entering");
+
 
 /*
  * application info and output file
@@ -221,6 +234,7 @@ static string outFilename = DEFAULT_OUT_FN;
 static ofstream outFile;
 static struct timeval startTime;
 static struct timeval endTime;
+static std::set<string> functions;
 
 /*
  * disassembled instructions (used for debugging output)
@@ -247,6 +261,21 @@ static SH_TYPE xmm[16*4];   // striped: all first slots, then all second, etc.
  * basic STL unordered map and 2) a hand-written bitmask-based array
  */
 
+typedef struct {
+   string filename;
+   string func;
+   string img;
+   int linenumber;
+   int num_writes;
+   int sample_count;
+   std::list<double> errors;
+} ins_t;
+
+ins_t fillSourceInfo(const ADDRINT ins);
+string getSourceInfo(const ADDRINT ins);
+void dumpLogs();
+VOID reportShadowValues();
+
 #define USE_STL_MAP 1
 
 #if USE_STL_MAP
@@ -255,17 +284,130 @@ static SH_TYPE xmm[16*4];   // striped: all first slots, then all second, etc.
  * IMPLEMENTATION #1: STL unordered map (slow but simple)
  */
 
+// Mutex to avoid multithreading issues when working with shadow memory.
+OS_MUTEX_TYPE memMapStdMutex;
+typedef std::pair<ADDRINT,ADDRINT> addr_t;
+
+struct addr_hash {
+    size_t operator()(const addr_t& p) const {
+        return p.first ^ p.second;
+    }
+};
+
 static unordered_map<ADDRINT,SH_TYPE> memMapStd;
+static vector<unordered_map<ADDRINT,SH_TYPE>> memMapStack;
+static unordered_map<ADDRINT,std::list<std::pair<double,double>>> insMapErrors;
+static unordered_map<ADDRINT,ins_t> insMapInfo;
+static unordered_map<ADDRINT,ADDRINT> insmemLastMap;
+static unordered_map<ADDRINT,int> insMapSamples;
+static unordered_map<ADDRINT,std::list<std::pair<ADDRINT,std::pair<double,double>>>> memMapErrors;
+static unordered_map<ADDRINT,int> memMapSamples;
+static unordered_map<addr_t,ins_t,addr_hash> insmemMap;
+
+static int num_items = 0;
 
 #define SHMEM_INIT          ;
 #define SHMEM_ACCESS(X)     memMapStd[X]
 #define SHMEM_SET_VALID(X)  ;
-#define SHMEM_CLEAR(X)      memMapStd.erase(X)
-#define SHMEM_IS_VALID(X)   (memMapStd.find(X) != memMapStd.end())
+#define SHMEM_CLEAR(X)      OS_MutexLock(&memMapStdMutex); memMapStd.erase(X);\
+					insmemLastMap.erase(X);OS_MutexUnlock(&memMapStdMutex);
+#define SHMEM_CLEARALL()    memMapStd.clear();insmemLastMap.clear();
+#define SHINSMEM_CLEAR(I,X) insmemMap.erase(std::make_pair(I,X));
 #define SHMEM_SIZE          memMapStd.size()
 #define SHMEM_FOR_EACH(X)   for (auto it = memMapStd.begin(); it != memMapStd.end(); it++) { \
                                 (X) = it->first;
+#define SHINS_FOR_EACH(X)   for (auto it = insMapErrors.begin(); it != insMapErrors.end(); it++) { \
+	                         			(X) = it->first;
+#define SHINSMEM_FOR_EACH(X,Y) for (auto it = insmemMap.begin(); it != insmemMap.end(); it++) { \
+                                (X) = it->first.first; (Y) = it->first.second;
 #define SHMEM_FINI          memMapStd.clear()
+
+inline bool SHMEM_IS_VALID(ADDRINT X) {
+	OS_MutexLock(&memMapStdMutex);
+	bool res = memMapStd.find(X) != memMapStd.end();
+	OS_MutexUnlock(&memMapStdMutex);
+	return res;
+}
+
+inline void SH_LOGMEMERR(ADDRINT I, ADDRINT M, double O) {
+	if (KnobTrackMemErrors.Value()) {
+		if (++num_items >= 10000000) dumpLogs();
+    if (memMapErrors.find(M) == memMapErrors.end())
+			memMapErrors[M] = std::list<std::pair<ADDRINT,std::pair<double,double>>>{};
+    if (memMapSamples.find(M) == memMapSamples.end())
+			memMapSamples[M] = 0;
+    if (KnobSamplingFrequency.Value() == memMapSamples[M]) {
+    	memMapSamples[M] = 0;
+			memMapErrors[M].push_back(std::make_pair(I,
+				std::make_pair(SH_ABSERR(SHMEM_ACCESS(M),O),SH_RELERR(SHMEM_ACCESS(M),O))));
+		}
+    else {
+			memMapSamples[M] = memMapSamples[M]+1;
+		}
+	}
+}
+
+inline double origVal(const CONTEXT *ctxt, INT32 r, ADDRINT mem)
+{
+	if (r != -1) {
+		CHAR fpContextSpaceForFpConextFromPin[FPSTATE_SIZE];
+		FPSTATE *fpContextFromPin = reinterpret_cast<FPSTATE *>(fpContextSpaceForFpConextFromPin);
+		PIN_GetContextFPState(ctxt, fpContextFromPin);
+		double reg_orig_val = 0.0;
+		memcpy(&reg_orig_val,&fpContextFromPin->fxsave_legacy._xmms[r]._vec64[0],sizeof(double));
+		return reg_orig_val;
+	}
+	else {
+		return *((double*)mem);
+	}
+}
+
+#define SH_VAL1(C,R,M)		double val1=origVal(C,R,M);
+#define SH_VAL2(C,R,M)		double val2=origVal(C,R,M);
+
+
+#define SH_SET_WRAP(A,I,V,X,O)  SH_SET(V,X);
+#define SH_COPY_WRAP(V,X,C,I,M,R,M2)   {SH_VAL1(C,R,M2); SH_COPY(V,X); SH_LOGINSERR(I,val1,X); SH_LOGMEMERR(I,M,val1);}
+#define SH_PACK_WRAP(V,X,A)			SH_PACK(V,X);
+#define SH_ALLOC_WRAP(V,A)      SH_ALLOC(V);
+#define SH_OUTPUT_WRAP(O,V,A)		SH_OUTPUT(O,V);
+
+inline void SH_LOGINSERR(ADDRINT I, double O, SH_TYPE S) {
+	if (KnobTrackInsErrors.Value()) {
+		if (++num_items >= 10000000)
+			dumpLogs();
+		if (insMapSamples.find(I) == insMapSamples.end()) {
+			insMapSamples[I] = 0;
+			insMapInfo[I] = fillSourceInfo(I);
+		}
+		if (KnobSamplingFrequency.Value() == insMapSamples[I]) {
+			insMapSamples[I] = 0;
+			insMapErrors[I].push_back(std::make_pair(SH_ABSERR(S,O),SH_RELERR(S,O)));
+		} else {
+			insMapSamples[I] = insMapSamples[I]+1;
+		}
+	}
+}
+
+#define SH_ADD_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_ADD(V,X); SH_LOGINSERR(I,val1+val2,xmm[R1]);}
+#define SH_SUB_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_SUB(V,X); SH_LOGINSERR(I,val1-val2,xmm[R1]);}
+#define SH_MUL_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_MUL(V,X); SH_LOGINSERR(I,val1*val2,xmm[R1]);}
+#define SH_DIV_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_DIV(V,X); SH_LOGINSERR(I,val1/val2,xmm[R1]);}
+#define SH_MIN_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_MIN(V,X); SH_LOGINSERR(I,fmin(val1,val2),xmm[R1]);}
+#define SH_MAX_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL1(C,R1,M); SH_VAL2(C,R2,M);  SH_MAX(V,X); SH_LOGINSERR(I,fmax(val1,val2),xmm[R1]);}
+#define SH_SQRT_WRAP(V,X,C,I,R1,R2,M)   {SH_VAL2(C,R2,M);  SH_SQRT(V,X); SH_LOGINSERR(I,sqrt(val2),xmm[R1]);}
+#define SH_RND_WRAP(V,X,C,I,R1,R2,M)    {SH_VAL2(C,R2,M);  SH_RND(V,X); SH_LOGINSERR(I,round(val2),xmm[R1]);}
+
+ /*
+  * utility method: dump logs to avoid out of memory exceptions.
+  */
+void dumpLogs() {
+ 	cout << "Dumping logs" << endl;
+ 	reportShadowValues();
+ 	insMapErrors.clear();
+ 	memMapErrors.clear();
+ 	num_items = 0;
+}
 
 #else
 
@@ -346,6 +488,13 @@ inline size_t calcMapOptSize()
                                 (X) = memMapAddr[__a];
 #define SHMEM_FINI          free(memMapValue); free(memMapValid); free(memMapAddr)
 
+/*
+* utility method: dump logs to avoid out of memory exceptions.
+*/
+void dumpLogs() {
+}
+
+
 #endif
 
 
@@ -364,6 +513,37 @@ inline const char* stripPath(const char *fn)
     } else {
         return fn;
     }
+}
+
+string getSourceInfo(const ADDRINT ins)
+{
+    PIN_LockClient();
+    int line;
+    string fn;
+    RTN rtn = RTN_FindByAddress(ins);
+    PIN_GetSourceLocation(ins, NULL, &line, &fn);
+    PIN_UnlockClient();
+    return "[" + (fn != "" ? RTN_Name(rtn) + ":" +
+			string(stripPath(fn.c_str())) + ":" + decstr(line) : "") + "]";
+}
+
+ins_t fillSourceInfo(const ADDRINT ins)
+{
+    PIN_LockClient();
+    int line;
+    ins_t info;
+    string fn;
+    IMG img = IMG_FindByAddress(ins);
+    if (IMG_Valid(img))
+			info.img = IMG_Name(img);
+    RTN rtn = RTN_FindByAddress(ins);
+    if (RTN_Valid(rtn))
+			info.func = RTN_Name(rtn);
+    PIN_GetSourceLocation(ins, NULL, &line, &fn);
+    info.linenumber = line;
+    info.filename = string(stripPath(fn.c_str()));
+    PIN_UnlockClient();
+    return info;
 }
 
 /*
@@ -428,7 +608,7 @@ VOID SHVAL_calloc_exit(ADDRINT addr)
     //
     SHVAL_malloc_exit(addr);
 }
-VOID SHVAL_realloc_exit(ADDRINT addr)
+VOID SHVAL_realloc_exit(ADDRINT addr, ADDRINT ins, const CONTEXT * ctxt)
 {
     if (regions.find(addr) != regions.end()) {
         LOG("WARNING - reallocation detected at " + hexstr(addr) + "\n");
@@ -448,10 +628,11 @@ VOID SHVAL_realloc_exit(ADDRINT addr)
                 ADDRINT oldAddr = reallocPtr + offset;
                 ADDRINT newAddr = addr + offset;
                 if (SHMEM_IS_VALID(oldAddr)) {
-                    SH_ALLOC(SHMEM_ACCESS(newAddr));
-                    SH_COPY(SHMEM_ACCESS(newAddr), SHMEM_ACCESS(oldAddr));
+                    SH_ALLOC_WRAP(SHMEM_ACCESS(newAddr),newAddr);
+										SH_COPY_WRAP(SHMEM_ACCESS(newAddr),SHMEM_ACCESS(oldAddr),ctxt,ins,newAddr,-1,oldAddr);
                     SH_FREE(SHMEM_ACCESS(oldAddr));
                     SHMEM_CLEAR(oldAddr);
+		    						SHINSMEM_CLEAR(ins,oldAddr);
                     valuesCopied++;
                 }
             }
@@ -472,7 +653,7 @@ VOID SHVAL_realloc_exit(ADDRINT addr)
  * update memory region tracker: free a region and clear corresponding entries
  * in the shadow value table
  */
-VOID SHVAL_free(ADDRINT addr)
+VOID SHVAL_free(ADDRINT ins, ADDRINT addr)
 {
     if (addr == 0) {
         return;     // free(0) is a nop as per the C99 standard
@@ -488,6 +669,7 @@ VOID SHVAL_free(ADDRINT addr)
         if (SHMEM_IS_VALID(mem)) {
             SH_FREE(SHMEM_ACCESS(mem));
             SHMEM_CLEAR(mem);
+	    			SHINSMEM_CLEAR(ins,mem);
         }
     }
     totalHeapBytesFreed += regions[addr];
@@ -513,22 +695,6 @@ VOID saveMemoryEA(const ADDRINT addr)
  * count of runtime errors detected
  */
 static UINT64 totalRuntimeErrors = 0;
-
-/*
- * retrieve source code info (this is expensive, so don't do it often)
- */
-inline string getSourceInfo(const ADDRINT ins)
-{
-    PIN_LockClient();
-    int line;
-    string fn;
-    IMG img = IMG_FindByAddress(ins);
-    PIN_GetSourceLocation(ins, NULL, &line, &fn);
-    PIN_UnlockClient();
-    return "[" + (fn != ""
-                    ? string(stripPath(fn.c_str())) + ":" + decstr(line)
-                    : string(stripPath(IMG_Name(img).c_str()))) + "]";
-}
 
 /*
  * checks shadow value at the saved memAddr for correctness
@@ -595,14 +761,37 @@ VOID reportShadowValues()
     }
 }
 
+VOID resetErrors()
+{
+	SHMEM_CLEARALL();
+
+}
+
+VOID handleEnterRoutine()
+{
+	if (KnobResetErrors.Value()) {
+		memMapStack.push_back(memMapStd);
+		resetErrors();
+	}
+}
+
+VOID handleExitRoutine()
+{
+	if (KnobResetErrors.Value()) {
+		memMapStd = memMapStack.back();
+		memMapStack.pop_back();
+	}
+}
+
+
 /*
  * make sure the shadow value map has an entry for the given address
  */
-inline VOID ensureMem32(const ADDRINT mem)
+inline VOID ensureMem32(const ADDRINT mem, const ADDRINT ins)
 {
     if (!SHMEM_IS_VALID(mem)) {
-        SH_ALLOC(SHMEM_ACCESS(mem));
-        SH_SET(SHMEM_ACCESS(mem), *(float*)mem);
+        SH_ALLOC_WRAP(SHMEM_ACCESS(mem),mem);
+        SH_SET_WRAP(mem,ins,SHMEM_ACCESS(mem), *(float*)mem, *(float*)mem);
         SHMEM_SET_VALID(mem);
     }
 }
@@ -610,11 +799,11 @@ inline VOID ensureMem32(const ADDRINT mem)
 /*
  * make sure the shadow value map has an entry for the given address
  */
-inline VOID ensureMem64(const ADDRINT mem)
+inline VOID ensureMem64(const ADDRINT mem, const ADDRINT ins)
 {
     if (!SHMEM_IS_VALID(mem)) {
-        SH_ALLOC(SHMEM_ACCESS(mem));
-        SH_SET(SHMEM_ACCESS(mem), *(double*)mem);
+				SH_ALLOC_WRAP(SHMEM_ACCESS(mem),mem);
+        SH_SET_WRAP(mem,ins,SHMEM_ACCESS(mem), *(double*)mem, *(double*)mem);
         SHMEM_SET_VALID(mem);
     }
 }
@@ -631,15 +820,15 @@ ADDRINT shadowMem64IsInvalid(const ADDRINT mem)
 {
     return !SHMEM_IS_VALID(mem);
 }
-VOID shadowMem64Init(const ADDRINT mem)
+VOID shadowMem64Init(const ADDRINT mem, const ADDRINT ins)
 {
-    SH_ALLOC(SHMEM_ACCESS(mem));
-    SH_SET(SHMEM_ACCESS(mem), *(double*)mem);
+    SH_ALLOC_WRAP(SHMEM_ACCESS(mem),mem);
+    SH_SET_WRAP(mem,ins,SHMEM_ACCESS(mem), *(double*)mem, *(double*)mem);
     SHMEM_SET_VALID(mem);
 }
 VOID shadowMem64InitEmpty(const ADDRINT mem)
 {
-    SH_ALLOC(SHMEM_ACCESS(mem));
+    SH_ALLOC_WRAP(SHMEM_ACCESS(mem),mem);
     SHMEM_SET_VALID(mem);
 }
 
@@ -685,6 +874,7 @@ VOID shadowMovToMem64(const ADDRINT ins, const ADDRINT mem)
         // clear the table
         SH_FREE(SHMEM_ACCESS(mem));
         SHMEM_CLEAR(mem);
+        SHINSMEM_CLEAR(ins,mem);
     }
 }
 
@@ -692,10 +882,11 @@ VOID shadowMovToMem64(const ADDRINT ins, const ADDRINT mem)
  * similar to above function but is streamlined so that If/Then instrumentation
  * can be inserted more efficiently (similar to ensureMem64)
  */
-VOID shadowClearMem64(const ADDRINT mem)
+VOID shadowClearMem64(const ADDRINT ins, const ADDRINT mem)
 {
     SH_FREE(SHMEM_ACCESS(mem));
     SHMEM_CLEAR(mem);
+    SHINSMEM_CLEAR(ins,mem);
 }
 
 /*
@@ -734,17 +925,17 @@ VOID shadowResetPackedReg64(UINT32 reg, const PIN_REGISTER *sreg)
  * WARNING: HERE BE MACROS! :)
  */
 
-VOID shadowMovScalarMem32ToReg32(const ADDRINT mem, UINT32 reg)
+VOID shadowMovScalarMem32ToReg32(const ADDRINT mem, const ADDRINT ins, UINT32 reg)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem32(mem);
+    ensureMem32(mem, ins);
     SH_COPY(xmm[reg], SHMEM_ACCESS(mem));
 }
 
-VOID shadowMovScalarReg32ToMem32(UINT32 reg, const ADDRINT mem)
+VOID shadowMovScalarReg32ToMem32(UINT32 reg, const ADDRINT ins, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem32(mem);
+    ensureMem32(mem, ins);
     SH_COPY(SHMEM_ACCESS(mem), xmm[reg]);
 }
 
@@ -760,14 +951,14 @@ VOID shadowMovScalarReg32ToReg32(UINT32 sreg, UINT32 dreg)
     SH_COPY(xmm[dreg], xmm[sreg]);
 }
 
-VOID shadowMovPackedMem32ToReg32(const ADDRINT mem, UINT32 reg)
+VOID shadowMovPackedMem32ToReg32(const ADDRINT mem, const ADDRINT ins, UINT32 reg)
 {
     DBG_ASSERT(reg < 16);
     //ensureMem32(mem);
-    ensureMem64(mem);
+    ensureMem64(mem, ins);
     //ensureMem32(mem+4);       // TODO: re-enable 32-bit slot handling
     //ensureMem32(mem+8);       // (causes bogus shadow values for 64-bit instructions!)
-    ensureMem64(mem+8);
+    ensureMem64(mem+8, ins);
     //ensureMem32(mem+12);
     SH_COPY(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
     //SH_COPY(xmm[XMM_SLOT(reg,1)], SHMEM_ACCESS(mem+4));
@@ -775,18 +966,18 @@ VOID shadowMovPackedMem32ToReg32(const ADDRINT mem, UINT32 reg)
     //SH_COPY(xmm[XMM_SLOT(reg,3)], SHMEM_ACCESS(mem+12));
 }
 
-VOID shadowMovPackedReg32ToMem32(UINT32 reg, const ADDRINT mem)
+VOID shadowMovPackedReg32ToMem32(UINT32 reg, const ADDRINT mem, const ADDRINT ins, const CONTEXT * ctxt)
 {
     DBG_ASSERT(reg < 16);
     //ensureMem32(mem);
-    ensureMem64(mem);
+    ensureMem64(mem, ins);
     //ensureMem32(mem+4);       // TODO: re-enable 32-bit slot handling
     //ensureMem32(mem+8);       // (causes bogus shadow values for 64-bit instructions!)
-    ensureMem64(mem+8);
+    ensureMem64(mem+8, ins);
     //ensureMem32(mem+12);
-    SH_COPY(SHMEM_ACCESS(mem),    xmm[XMM_SLOT(reg,0)]);
+    SH_COPY_WRAP(SHMEM_ACCESS(mem),xmm[XMM_SLOT(reg,0)],ctxt,ins,mem,XMM_SLOT(reg,0),-1);
     //SH_COPY(SHMEM_ACCESS(mem+4),  xmm[XMM_SLOT(reg,1)]);
-    SH_COPY(SHMEM_ACCESS(mem+8),  xmm[XMM_SLOT(reg,2)]);
+    SH_COPY_WRAP(SHMEM_ACCESS(mem+8),xmm[XMM_SLOT(reg,2)],ctxt,ins,mem+8,XMM_SLOT(reg,2),-1);
     //SH_COPY(SHMEM_ACCESS(mem+12), xmm[XMM_SLOT(reg,3)]);
 }
 
@@ -799,16 +990,16 @@ VOID shadowMovPackedReg32ToReg32(UINT32 sreg, UINT32 dreg)
     SH_COPY(xmm[XMM_SLOT(dreg,3)], xmm[XMM_SLOT(sreg,3)]);
 }
 
-VOID shadowMovScalarMem64ToReg64(const ADDRINT mem, UINT32 reg)
+VOID shadowMovScalarMem64ToReg64(const ADDRINT mem, const ADDRINT ins, UINT32 reg)
 {
     DBG_ASSERT(reg < 16);
     SH_COPY(xmm[reg], SHMEM_ACCESS(mem));
 }
 
-VOID shadowMovScalarReg64ToMem64(UINT32 reg, const ADDRINT mem)
+VOID shadowMovScalarReg64ToMem64(UINT32 reg, const ADDRINT mem, const ADDRINT ins, const CONTEXT * ctxt)
 {
     DBG_ASSERT(reg < 16);
-    SH_COPY(SHMEM_ACCESS(mem), xmm[reg]);
+    SH_COPY_WRAP(SHMEM_ACCESS(mem), xmm[reg], ctxt, ins, mem, reg, -1);
 }
 
 VOID shadowMovScalarGPR64ToReg64(const PIN_REGISTER *sreg, UINT32 dreg)
@@ -823,18 +1014,18 @@ VOID shadowMovScalarReg64ToReg64(UINT32 sreg, UINT32 dreg)
     SH_COPY(xmm[dreg], xmm[sreg]);
 }
 
-VOID shadowMovPackedMem64ToReg64(const ADDRINT mem, UINT32 reg)
+VOID shadowMovPackedMem64ToReg64(const ADDRINT mem, const ADDRINT ins, UINT32 reg)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem+8);
+    ensureMem64(mem+8, ins);
     SH_COPY(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
     SH_COPY(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8));
 }
 
-VOID shadowMovPackedReg64ToMem64(UINT32 reg, const ADDRINT mem)
+VOID shadowMovPackedReg64ToMem64(UINT32 reg, const ADDRINT ins, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem+8);
+    ensureMem64(mem+8, ins);
     SH_COPY(SHMEM_ACCESS(mem), xmm[XMM_SLOT(reg,0)]);
     SH_COPY(SHMEM_ACCESS(mem+8), xmm[XMM_SLOT(reg,2)]);
 }
@@ -846,7 +1037,7 @@ VOID shadowMovPackedReg64ToReg64(UINT32 sreg, UINT32 dreg)
     SH_COPY(xmm[XMM_SLOT(dreg,2)], xmm[XMM_SLOT(sreg,2)]);
 }
 
-VOID shadowMovHighMem64ToReg64(const ADDRINT mem, UINT32 reg)
+VOID shadowMovHighMem64ToReg64(const ADDRINT mem, const ADDRINT ins, UINT32 reg)
 {
     DBG_ASSERT(reg < 16);
     SH_COPY(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem));
@@ -905,97 +1096,154 @@ VOID shadowMOVDDUP(UINT32 reg1, UINT32 reg2)
 {   SH_COPY(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
     SH_COPY(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,0)]); }
 
-VOID shadowADDSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_ADD(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowSUBSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_SUB(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowMULSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_MUL(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowDIVSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_DIV(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowMINSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_MIN(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowMAXSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_MAX(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowSQRTSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_SQRT(xmm[reg], SHMEM_ACCESS(mem)); }
-VOID shadowRNDSD_Mem64(UINT32 reg, const ADDRINT mem)
-{ SH_RND(xmm[reg], SHMEM_ACCESS(mem)); }
+VOID shadowADDSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_ADD_WRAP(xmm[reg], SHMEM_ACCESS(mem),ctxt,ins,reg,-1,mem);
+}
+VOID shadowSUBSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_SUB_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowMULSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_MUL_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowDIVSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_DIV_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowMINSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_MIN_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowMAXSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_MAX_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowSQRTSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_SQRT_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
+VOID shadowRNDSD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, ADDRINT ins)
+{
+	SH_RND_WRAP(xmm[reg], SHMEM_ACCESS(mem), ctxt, ins, reg, -1, mem);
+}
 
-VOID shadowADDSD(UINT32 reg1, UINT32 reg2) { SH_ADD(xmm[reg1], xmm[reg2]); }
-VOID shadowSUBSD(UINT32 reg1, UINT32 reg2) { SH_SUB(xmm[reg1], xmm[reg2]); }
-VOID shadowMULSD(UINT32 reg1, UINT32 reg2) { SH_MUL(xmm[reg1], xmm[reg2]); }
-VOID shadowDIVSD(UINT32 reg1, UINT32 reg2) { SH_DIV(xmm[reg1], xmm[reg2]); }
-VOID shadowMINSD(UINT32 reg1, UINT32 reg2) { SH_MIN(xmm[reg1], xmm[reg2]); }
-VOID shadowMAXSD(UINT32 reg1, UINT32 reg2) { SH_MAX(xmm[reg1], xmm[reg2]); }
-VOID shadowSQRTSD(UINT32 reg1, UINT32 reg2){ SH_SQRT(xmm[reg1],xmm[reg2]); }
-VOID shadowRNDSD(UINT32 reg1, UINT32 reg2) { SH_RND(xmm[reg1], xmm[reg2]); }
+VOID shadowADDSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_ADD_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowSUBSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_SUB_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowMULSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_MUL_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowDIVSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_DIV_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowMINSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_MIN_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowMAXSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_MAX_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowSQRTSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins){
+	SH_SQRT_WRAP(xmm[reg1],xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
+VOID shadowRNDSD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, ADDRINT ins) {
+	SH_RND_WRAP(xmm[reg1], xmm[reg2],ctxt,ins,reg1,reg2,0);
+}
 
-VOID shadowADDPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_ADD(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_ADD(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowSUBPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_SUB(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_SUB(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowMULPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_MUL(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_MUL(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowDIVPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_DIV(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_DIV(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowMINPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_MIN(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_MIN(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowMAXPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_MAX(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_MAX(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowSQRTPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_SQRT(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_SQRT(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
-VOID shadowRNDPD_Mem64(UINT32 reg, const ADDRINT mem)
-{   ensureMem64(mem+8);
-    SH_RND(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem));
-    SH_RND(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8)); }
+VOID shadowADDPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowSUBPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_SUB_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_SUB_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowMULPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_MUL_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_MUL_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowDIVPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_DIV_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_DIV_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowMINPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_MIN_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_MIN_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowMAXPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_MAX_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_MAX_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowSQRTPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_SQRT_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_SQRT_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
+VOID shadowRNDPD_Mem64(UINT32 reg, const ADDRINT mem, const CONTEXT * ctxt, const ADDRINT ins)
+{   ensureMem64(mem+8,ins);
+    SH_RND_WRAP(xmm[XMM_SLOT(reg,0)], SHMEM_ACCESS(mem), ctxt, ins, XMM_SLOT(reg,0), -1, mem);
+    SH_RND_WRAP(xmm[XMM_SLOT(reg,2)], SHMEM_ACCESS(mem+8), ctxt, ins, XMM_SLOT(reg,2), -1, mem+8);
+}
 
-VOID shadowADDPD(UINT32 reg1, UINT32 reg2)
-{ SH_ADD(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_ADD(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowSUBPD(UINT32 reg1, UINT32 reg2)
-{ SH_SUB(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_SUB(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowMULPD(UINT32 reg1, UINT32 reg2)
-{ SH_MUL(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_MUL(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowDIVPD(UINT32 reg1, UINT32 reg2)
-{ SH_DIV(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_DIV(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowMINPD(UINT32 reg1, UINT32 reg2)
-{ SH_MIN(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_MIN(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowMAXPD(UINT32 reg1, UINT32 reg2)
-{ SH_MAX(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_MAX(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowSQRTPD(UINT32 reg1, UINT32 reg2)
-{ SH_SQRT(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_SQRT(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
-VOID shadowRNDPD(UINT32 reg1, UINT32 reg2)
-{ SH_RND(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-  SH_RND(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]); }
+VOID shadowADDPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_ADD_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+  	SH_ADD_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowSUBPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_SUB_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+	SH_SUB_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowMULPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_MUL_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+	SH_MUL_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowDIVPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_DIV_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+	SH_DIV_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowMINPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_MIN_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+  	SH_MIN_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowMAXPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_MAX_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+	SH_MAX_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowSQRTPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_SQRT_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+  	SH_SQRT_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+VOID shadowRNDPD(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
+{
+	SH_RND_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+	SH_RND_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+}
+
 
 // TODO: other 32-bit floating-point instructions (currently unsupported)
-VOID shadowADDPS(UINT32 reg1, UINT32 reg2)
+VOID shadowADDPS(UINT32 reg1, UINT32 reg2, const CONTEXT * ctxt, const ADDRINT ins)
 {
-    SH_ADD(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)]);
-    SH_ADD(xmm[XMM_SLOT(reg1,1)], xmm[XMM_SLOT(reg2,1)]);
-    SH_ADD(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)]);
-    SH_ADD(xmm[XMM_SLOT(reg1,3)], xmm[XMM_SLOT(reg2,3)]);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg1,0)], xmm[XMM_SLOT(reg2,0)], ctxt, ins, XMM_SLOT(reg1,0), XMM_SLOT(reg2,0), 0);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg1,1)], xmm[XMM_SLOT(reg2,1)], ctxt, ins, XMM_SLOT(reg1,1), XMM_SLOT(reg2,1), 0);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg1,2)], xmm[XMM_SLOT(reg2,2)], ctxt, ins, XMM_SLOT(reg1,2), XMM_SLOT(reg2,2), 0);
+    SH_ADD_WRAP(xmm[XMM_SLOT(reg1,3)], xmm[XMM_SLOT(reg2,3)], ctxt, ins, XMM_SLOT(reg1,3), XMM_SLOT(reg2,3), 0);
 }
 
 VOID shadowCVTSI2SD_Mem64(const ADDRINT mem, UINT32 dreg)
@@ -1132,8 +1380,8 @@ VOID shadowANDPD(ADDRINT ins, UINT32 reg1, UINT32 reg2,
 VOID shadowANDPD_Mem64(ADDRINT ins, UINT32 reg, const PIN_REGISTER *regv, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem);
-    ensureMem64(mem+8);
+    ensureMem64(mem, ins);
+    ensureMem64(mem+8, ins);
     shadowAND64(ins, &xmm[XMM_SLOT(reg,0)], &SHMEM_ACCESS(mem),   regv->qword[0], *(UINT64*)(mem));
     shadowAND64(ins, &xmm[XMM_SLOT(reg,2)], &SHMEM_ACCESS(mem+8), regv->qword[1], *(UINT64*)(mem+8));
     shadowClearReg32SlotsReg64(reg);      // for PAND
@@ -1151,8 +1399,8 @@ VOID shadowANDNPD(ADDRINT ins, UINT32 reg1, UINT32 reg2,
 VOID shadowANDNPD_Mem64(ADDRINT ins, UINT32 reg, const PIN_REGISTER *regv, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem);
-    ensureMem64(mem+8);
+    ensureMem64(mem, ins);
+    ensureMem64(mem+8, ins);
     shadowAND64(ins, &xmm[XMM_SLOT(reg,0)], &SHMEM_ACCESS(mem),   ~regv->qword[0], ~(*(UINT64*)(mem)));
     shadowAND64(ins, &xmm[XMM_SLOT(reg,2)], &SHMEM_ACCESS(mem+8), ~regv->qword[1], ~(*(UINT64*)(mem+8)));
     shadowClearReg32SlotsReg64(reg);      // for ANDN
@@ -1183,8 +1431,8 @@ VOID shadowORPD(ADDRINT ins, UINT32 reg1, UINT32 reg2,
 VOID shadowORPD_Mem64(ADDRINT ins, UINT32 reg, const PIN_REGISTER *regv, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem);
-    ensureMem64(mem+8);
+    ensureMem64(mem, ins);
+    ensureMem64(mem+8, ins);
     shadowOR64(ins, &xmm[XMM_SLOT(reg,0)], &SHMEM_ACCESS(mem),   regv->qword[0], *(UINT64*)(mem));
     shadowOR64(ins, &xmm[XMM_SLOT(reg,2)], &SHMEM_ACCESS(mem+8), regv->qword[1], *(UINT64*)(mem+8));
     shadowClearReg32SlotsReg64(reg);      // for POR
@@ -1217,8 +1465,8 @@ VOID shadowXORPD(ADDRINT ins, UINT32 reg1, UINT32 reg2,
 VOID shadowXORPD_Mem64(ADDRINT ins, UINT32 reg, const PIN_REGISTER *regv, const ADDRINT mem)
 {
     DBG_ASSERT(reg < 16);
-    ensureMem64(mem);
-    ensureMem64(mem+8);
+    ensureMem64(mem, ins);
+    ensureMem64(mem+8, ins);
     shadowXOR64(ins, &xmm[XMM_SLOT(reg,0)], &SHMEM_ACCESS(mem),   regv->qword[0], *(UINT64*)(mem));
     shadowXOR64(ins, &xmm[XMM_SLOT(reg,2)], &SHMEM_ACCESS(mem+8), regv->qword[1], *(UINT64*)(mem+8));
     shadowClearReg32SlotsReg64(reg);      // for PXOR
@@ -1263,14 +1511,15 @@ inline void shadowMPIFree(mpiPackedValue *src, int count)
 /*
  * allocate and pack temporary array of shadow values for MPI communication
  */
-inline mpiPackedValue* shadowMPIPack(void *src, int count)
+inline mpiPackedValue* shadowMPIPack(ADDRINT ins, void *src, int count)
 {
     mpiPackedValue *dest = shadowMPIAlloc(count);
     ADDRINT addr = (ADDRINT)src;
     for (int i = 0; i < count; i++) {
         dest[i].sys = *(double*)addr;
-        ensureMem64(addr);
+        ensureMem64(addr, ins);
         SH_PACK(dest[i].shv, SHMEM_ACCESS(addr));
+				SH_PACK_WRAP(dest[i].shv, SHMEM_ACCESS(addr), addr);
         addr += 8;
     }
     return dest;
@@ -1285,7 +1534,7 @@ inline void shadowMPIUnpack(void *dest, mpiPackedValue *src, int count)
     for (int i = 0; i < count; i++) {
         *(double*)addr = src[i].sys;
         if (!SHMEM_IS_VALID(addr)) {
-            SH_ALLOC(SHMEM_ACCESS(addr));
+            SH_ALLOC_WRAP(SHMEM_ACCESS(addr),addr);
             SHMEM_SET_VALID(addr);
         }
         SH_UNPACK(SHMEM_ACCESS(addr), src[i].shv);
@@ -1337,7 +1586,7 @@ std::unordered_map<MPI_Request,mpiNonBlockOp> nonblockingOps;
  * MPI wrappers
  */
 
-int shadowMPISend(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPISend(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *buf, int count, MPI_Datatype dt, int dest, int tag, MPI_Comm comm)
 {
     int rval;   // return value
@@ -1345,7 +1594,7 @@ int shadowMPISend(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     // if double precision, pack and send shadow values too
     if (dt == MPI_DOUBLE || dt == MPI_DOUBLE_PRECISION) {
         //printf("Shadowing MPI_Send (count=%d, dest=%d, tag=%d)\n", count, dest, tag);
-        mpiPackedValue *tmp = shadowMPIPack(buf, count);
+        mpiPackedValue *tmp = shadowMPIPack(ins, buf, count);
         PIN_CallApplicationFunction(ctx, tid, CALLINGSTD_DEFAULT, origFunPtr, NULL,
                 PIN_PARG(int),          &rval,
                 PIN_PARG(void*),        tmp,
@@ -1372,7 +1621,7 @@ int shadowMPISend(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIRecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIRecv(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *buf, int count, MPI_Datatype dt, int src, int tag, MPI_Comm comm, MPI_Status *status)
 {
     int rval;   // return value
@@ -1409,7 +1658,7 @@ int shadowMPIRecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPISendrecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPISendrecv(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, int send_count, MPI_Datatype send_dt, int dest,   int send_tag,
         void *recv_buf, int recv_count, MPI_Datatype recv_dt, int source, int recv_tag,
         MPI_Comm comm, MPI_Status *status)
@@ -1419,7 +1668,7 @@ int shadowMPISendrecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     // if double precision, pack and send shadow values too
     if (send_dt == MPI_DOUBLE || send_dt == MPI_DOUBLE_PRECISION) {
         //printf("Shadowing MPI_Sendrecv (count=%d, tag=%d)\n", send_count, send_tag);
-        mpiPackedValue *src = shadowMPIPack(send_buf, send_count);
+        mpiPackedValue *src = shadowMPIPack(ins, send_buf, send_count);
         mpiPackedValue *dst = shadowMPIAlloc(recv_count);
         PIN_CallApplicationFunction(ctx, tid, CALLINGSTD_DEFAULT, origFunPtr, NULL,
                 PIN_PARG(int),          &rval,
@@ -1460,14 +1709,14 @@ int shadowMPISendrecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIIsend(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIIsend(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *buf, int count, MPI_Datatype dt, int dest, int tag, MPI_Comm comm, MPI_Request *rq)
 {
     int rval;   // return value
 
     // if double precision, pack and send shadow values too
     if (dt == MPI_DOUBLE || dt == MPI_DOUBLE_PRECISION) {
-        mpiPackedValue *tmp = shadowMPIPack(buf, count);
+        mpiPackedValue *tmp = shadowMPIPack(ins, buf, count);
         PIN_CallApplicationFunction(ctx, tid, CALLINGSTD_DEFAULT, origFunPtr, NULL,
                 PIN_PARG(int),          &rval,
                 PIN_PARG(void*),        tmp,
@@ -1502,7 +1751,7 @@ int shadowMPIIsend(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIIrecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIIrecv(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *buf, int count, MPI_Datatype dt, int src, int tag, MPI_Comm comm, MPI_Request *rq)
 {
     int rval;   // return value
@@ -1544,7 +1793,7 @@ int shadowMPIIrecv(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIWait(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIWait(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         MPI_Request *rq, MPI_Status *status)
 {
     int rval;   // return value
@@ -1575,7 +1824,7 @@ int shadowMPIWait(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 }
 
 
-int shadowMPIBcast(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIBcast(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *buf, int count, MPI_Datatype dt, int root, MPI_Comm comm)
 {
     int rval;   // original return value
@@ -1583,7 +1832,7 @@ int shadowMPIBcast(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     // if double precision, pack and broadcast shadow values too
     if (dt == MPI_DOUBLE || dt == MPI_DOUBLE_PRECISION) {
         //printf("Shadowing MPI_Bcast (count=%d, root=%d)\n", count, root);
-        mpiPackedValue *tmp = shadowMPIPack(buf, count);
+        mpiPackedValue *tmp = shadowMPIPack(ins, buf, count);
         PIN_CallApplicationFunction(ctx, tid, CALLINGSTD_DEFAULT, origFunPtr, NULL,
                 PIN_PARG(int),          &rval,
                 PIN_PARG(void*),        tmp,
@@ -1608,7 +1857,7 @@ int shadowMPIBcast(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIScatter(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIScatter(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, int send_count, MPI_Datatype send_dt,
         void *recv_buf, int recv_count, MPI_Datatype recv_dt,
         int root, MPI_Comm comm)
@@ -1625,7 +1874,7 @@ int shadowMPIScatter(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         // pack outgoing shadow values and allocate incoming array
         mpiPackedValue *src = NULL, *dst = shadowMPIAlloc(recv_count);
         if (mpiRank == root) {
-            src = shadowMPIPack(send_buf, send_count * mpiSize);
+            src = shadowMPIPack(ins, send_buf, send_count * mpiSize);
         }
 
         // send out shadow values from root
@@ -1664,7 +1913,7 @@ int shadowMPIScatter(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIGather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIGather(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, int send_count, MPI_Datatype send_dt,
         void *recv_buf, int recv_count, MPI_Datatype recv_dt,
         int root, MPI_Comm comm)
@@ -1680,7 +1929,7 @@ int shadowMPIGather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 
         // pack outgoing shadow values and allocate incoming array
         mpiPackedValue *src, *dst = NULL;
-        src = shadowMPIPack(send_buf, send_count);
+        src = shadowMPIPack(ins, send_buf, send_count);
         if (mpiRank == root) {
             dst = shadowMPIAlloc(recv_count * mpiSize);
         }
@@ -1721,7 +1970,7 @@ int shadowMPIGather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIAllgather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIAllgather(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, int send_count, MPI_Datatype send_dt,
         void *recv_buf, int recv_count, MPI_Datatype recv_dt, MPI_Comm comm)
 {
@@ -1736,7 +1985,7 @@ int shadowMPIAllgather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 
         // pack outgoing shadow values and allocate incoming array
         mpiPackedValue *src, *dst;
-        src = shadowMPIPack(send_buf, send_count);
+        src = shadowMPIPack(ins, send_buf, send_count);
         dst = shadowMPIAlloc(recv_count * mpiSize);
 
         // collect shadow values too
@@ -1771,7 +2020,7 @@ int shadowMPIAllgather(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIAlltoall(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIAlltoall(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, int send_count, MPI_Datatype send_dt,
         void *recv_buf, int recv_count, MPI_Datatype recv_dt, MPI_Comm comm)
 {
@@ -1786,7 +2035,7 @@ int shadowMPIAlltoall(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 
         // pack outgoing shadow values and allocate incoming array
         mpiPackedValue *src, *dst;
-        src = shadowMPIPack(send_buf, send_count * mpiSize);
+        src = shadowMPIPack(ins, send_buf, send_count * mpiSize);
         dst = shadowMPIAlloc(recv_count * mpiSize);
 
         // collect shadow values too
@@ -1861,7 +2110,7 @@ void shadowMPIOpMax(void *invec, void *inoutvec, int *len, MPI_Datatype *dt)
         SH_UNPACK(t1, dest->shv);
         SH_UNPACK(t2, src->shv);
         SH_MAX(t1, t2);
-        SH_PACK(dest->shv, t1);
+        SH_PACK_WRAP(dest->shv, t1, 0);
         SH_FREE(t1); SH_FREE(t2);
         dest++;
         src++;
@@ -1879,7 +2128,7 @@ void shadowMPIOpMin(void *invec, void *inoutvec, int *len, MPI_Datatype *dt)
         SH_UNPACK(t1, dest->shv);
         SH_UNPACK(t2, src->shv);
         SH_MIN(t1, t2);
-        SH_PACK(dest->shv, t1);
+        SH_PACK_WRAP(dest->shv, t1, 0);
         SH_FREE(t1); SH_FREE(t2);
         dest++;
         src++;
@@ -1897,7 +2146,7 @@ void shadowMPIOpSum(void *invec, void *inoutvec, int *len, MPI_Datatype *dt)
         SH_UNPACK(t1, dest->shv);
         SH_UNPACK(t2, src->shv);
         SH_ADD(t1, t2);
-        SH_PACK(dest->shv, t1);
+        SH_PACK_WRAP(dest->shv, t1, 0);
         SH_FREE(t1); SH_FREE(t2);
         //SH_SET(dest->shv, 0.0);       // for testing
         dest++;
@@ -1916,7 +2165,7 @@ void shadowMPIOpProd(void *invec, void *inoutvec, int *len, MPI_Datatype *dt)
         SH_UNPACK(t1, dest->shv);
         SH_UNPACK(t2, src->shv);
         SH_MUL(t1, t2);
-        SH_PACK(dest->shv, t1);
+        SH_PACK_WRAP(dest->shv, t1, 0);
         SH_FREE(t1); SH_FREE(t2);
         dest++;
         src++;
@@ -1987,7 +2236,7 @@ inline MPI_Op getShadowMPIOp(MPI_Op op)
  * MPI wrappers
  */
 
-int shadowMPIAllreduce(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIAllreduce(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, void *recv_buf, int count, MPI_Datatype dt, MPI_Op op, MPI_Comm comm)
 {
     int rval;   // original return value
@@ -2002,7 +2251,7 @@ int shadowMPIAllreduce(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 
         // copy shadow values into (packed) temporary source array and
         // initialize temporary destination array
-        mpiPackedValue *src  = shadowMPIPack(send_buf, count);
+        mpiPackedValue *src  = shadowMPIPack(ins, send_buf, count);
         mpiPackedValue *dest = shadowMPIAlloc(count);
 
         PIN_CallApplicationFunction(ctx, tid, CALLINGSTD_DEFAULT, origFunPtr, NULL,
@@ -2033,7 +2282,7 @@ int shadowMPIAllreduce(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
     return rval;
 }
 
-int shadowMPIReduce(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
+int shadowMPIReduce(ADDRINT ins, const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
         void *send_buf, void *recv_buf, int count, MPI_Datatype dt, MPI_Op op, int root, MPI_Comm comm)
 {
     int rval;   // original return value
@@ -2051,7 +2300,7 @@ int shadowMPIReduce(const CONTEXT *ctx, THREADID tid, AFUNPTR origFunPtr,
 
         // copy shadow values into (packed) temporary source array and
         // initialize temporary destination array if we're the root
-        mpiPackedValue *src  = shadowMPIPack(send_buf, count);
+        mpiPackedValue *src  = shadowMPIPack(ins, send_buf, count);
         mpiPackedValue *dest = NULL;
         if (mpiRank == root) {
             dest = shadowMPIAlloc(count);
@@ -2152,7 +2401,7 @@ void insertAllocCalls(RTN rtn, AFUNPTR entryFunc, AFUNPTR exitFunc, bool twoArgs
     if (twoArgs) {
         RTN_InsertCall(rtn, IPOINT_BEFORE, entryFunc,
                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+                IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_CONST_CONTEXT, IARG_END);
     } else {
         RTN_InsertCall(rtn, IPOINT_BEFORE, entryFunc,
                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
@@ -2171,7 +2420,7 @@ VOID reportShadowArray(ADDRINT, UINT64, ADDRINT);
 /*
  * helper for inserting function-based calls
  */
-void insertRtnCall(RTN rtn, IPOINT action, AFUNPTR func, int numArgs)
+void insertRtnCall(RTN rtn, IPOINT action, AFUNPTR func, int numArgs, ADDRINT ins)
 {
     RTN_Open(rtn);
     switch (numArgs) {
@@ -2179,7 +2428,7 @@ void insertRtnCall(RTN rtn, IPOINT action, AFUNPTR func, int numArgs)
             RTN_InsertCall(rtn, action, func, IARG_END);
             break;
         case 1:
-            RTN_InsertCall(rtn, action, func,
+            RTN_InsertCall(rtn, action, func, IARG_ADDRINT, ins,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
             break;
         case 2:
@@ -2205,18 +2454,18 @@ void insertRtnCall(RTN rtn, IPOINT action, AFUNPTR func, int numArgs)
 /*
  * helper for wrapping functions
  */
-void replaceRtn(RTN rtn, AFUNPTR func, int numArgs)
+void replaceRtn(RTN rtn, AFUNPTR func, int numArgs, ADDRINT ins)
 {
     switch (numArgs) {
         case 2:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
                     IARG_END);
             break;
         case 5:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
@@ -2226,7 +2475,7 @@ void replaceRtn(RTN rtn, AFUNPTR func, int numArgs)
                     IARG_END);
             break;
         case 6:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
@@ -2237,7 +2486,7 @@ void replaceRtn(RTN rtn, AFUNPTR func, int numArgs)
                     IARG_END);
             break;
         case 7:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
@@ -2249,7 +2498,7 @@ void replaceRtn(RTN rtn, AFUNPTR func, int numArgs)
                     IARG_END);
            break;
         case 8:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
@@ -2262,7 +2511,7 @@ void replaceRtn(RTN rtn, AFUNPTR func, int numArgs)
                     IARG_END);
            break;
         case 12:
-            RTN_ReplaceSignature(rtn, func,
+            RTN_ReplaceSignature(rtn, func, IARG_ADDRINT, ins,
                     IARG_CONST_CONTEXT, IARG_THREAD_ID, IARG_ORIG_FUNCPTR,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
@@ -2304,43 +2553,46 @@ VOID handleRoutine(RTN rtn, VOID *)
         insertAllocCalls(rtn, (AFUNPTR)SHVAL_realloc_entry,
                 (AFUNPTR)SHVAL_realloc_exit, true);
     } else if (name == "free" || name == "__libc_free") {
-        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)SHVAL_free, 1);
+        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)SHVAL_free, 1, RTN_Address(rtn));
     } else if (name == "SHVAL_reportShadowValue") {
-        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)reportShadowValue, 2);
+        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)reportShadowValue, 2, RTN_Address(rtn));
     } else if (name == "SHVAL_reportShadowArray") {
-        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)reportShadowArray, 3);
+        insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR)reportShadowArray, 3, RTN_Address(rtn));
     } else if (name == KnobReportFunction.Value()) {
         LOG("Reporting shadow values after function \"" + name + "\"\n");
-        insertRtnCall(rtn, IPOINT_AFTER, (AFUNPTR)reportShadowValues, 0);
+        insertRtnCall(rtn, IPOINT_AFTER, (AFUNPTR)reportShadowValues, 0, RTN_Address(rtn));
 #if USE_MPI
     } else if (name == "MPI_Send"      || name == "PMPI_Send") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPISend, 6);
+        replaceRtn(rtn, (AFUNPTR)shadowMPISend, 6, RTN_Address(rtn));
     } else if (name == "MPI_Recv"      || name == "PMPI_Recv") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIRecv, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIRecv, 7, RTN_Address(rtn));
     } else if (name == "MPI_Sendrecv"  || name == "PMPI_Sendrecv") {
         replaceRtn(rtn, (AFUNPTR)shadowMPISendrecv, 12);
     } else if (name == "MPI_Isend"     || name == "PMPI_Isend") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIIsend, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIIsend, 7, RTN_Address(rtn));
     } else if (name == "MPI_Irecv"     || name == "PMPI_Irecv") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIIrecv, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIIrecv, 7, RTN_Address(rtn));
     } else if (name == "MPI_Wait"      || name == "PMPI_Wait") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIWait, 2);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIWait, 2, RTN_Address(rtn));
     } else if (name == "MPI_Bcast"     || name == "PMPI_Bcast") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIBcast, 5);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIBcast, 5, RTN_Address(rtn));
     } else if (name == "MPI_Scatter"   || name == "PMPI_Scatter") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIScatter, 8);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIScatter, 8, RTN_Address(rtn));
     } else if (name == "MPI_Gather"    || name == "PMPI_Gather") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIGather, 8);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIGather, 8, RTN_Address(rtn));
     } else if (name == "MPI_Allgather" || name == "PMPI_Allgather") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIAllgather, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIAllgather, 7, RTN_Address(rtn));
     } else if (name == "MPI_Alltoall"  || name == "PMPI_Alltoall") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIAlltoall, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIAlltoall, 7, RTN_Address(rtn));
     } else if (name == "MPI_Allreduce" || name == "PMPI_Allreduce") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIAllreduce, 6);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIAllreduce, 6, RTN_Address(rtn));
     } else if (name == "MPI_Reduce"    || name == "PMPI_Reduce") {
-        replaceRtn(rtn, (AFUNPTR)shadowMPIReduce, 7);
+        replaceRtn(rtn, (AFUNPTR)shadowMPIReduce, 7, RTN_Address(rtn));
 #endif
-    }
+		} else if (KnobResetErrors.Value() && functions.find(name) != functions.end()) {
+			insertRtnCall(rtn, IPOINT_BEFORE, (AFUNPTR) handleEnterRoutine, 0, RTN_Address(rtn));
+			insertRtnCall(rtn, IPOINT_AFTER, (AFUNPTR) handleExitRoutine, 0, RTN_Address(rtn));
+		}
 }
 
 /*
@@ -2398,7 +2650,7 @@ VOID insertMovCall(INS ins, AFUNPTR readMemFunc, AFUNPTR writeMemFunc, AFUNPTR r
         INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)shadowMem64Init,
                 IARG_MEMORYREAD_EA, IARG_CALL_ORDER, CALL_ORDER_FIRST, IARG_END);
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)readMemFunc,
-                IARG_MEMORYREAD_EA,
+                IARG_MEMORYREAD_EA, IARG_INST_PTR,
                 IARG_UINT32, encodeXMMRegW(ins, 0),
                 IARG_CALL_ORDER, CALL_ORDER_LAST,
                 IARG_END);
@@ -2410,7 +2662,7 @@ VOID insertMovCall(INS ins, AFUNPTR readMemFunc, AFUNPTR writeMemFunc, AFUNPTR r
                 IARG_MEMORYWRITE_EA, IARG_CALL_ORDER, CALL_ORDER_FIRST, IARG_END);
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)writeMemFunc,
                 IARG_UINT32, encodeXMMRegR(ins, 0),
-                IARG_MEMORYWRITE_EA,
+                IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_CONST_CONTEXT,
                 IARG_CALL_ORDER, CALL_ORDER_LAST,
                 IARG_END);
         totalInstructions++;
@@ -2498,7 +2750,7 @@ VOID insertBinOpCall(INS ins, AFUNPTR memFunc, AFUNPTR regFunc)
                     IARG_MEMORYREAD_EA, IARG_CALL_ORDER, CALL_ORDER_FIRST, IARG_END);
             INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)memFunc,
                     IARG_UINT32, encodeXMMRegW(ins,0),
-                    IARG_MEMORYREAD_EA,
+                    IARG_MEMORYREAD_EA, IARG_CONST_CONTEXT, IARG_INST_PTR,
                     IARG_END);
             totalInstructions++;
         } else {
@@ -2511,6 +2763,7 @@ VOID insertBinOpCall(INS ins, AFUNPTR memFunc, AFUNPTR regFunc)
             INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)regFunc,
                     IARG_UINT32, encodeXMMRegR(ins,0),
                     IARG_UINT32, encodeXMMRegR(ins,1),
+										IARG_CONST_CONTEXT, IARG_INST_PTR,
                     IARG_END);
             totalInstructions++;
         } else {
@@ -2542,6 +2795,7 @@ VOID insertUnOpCall(INS ins, AFUNPTR memFunc, AFUNPTR regFunc)
                     (AFUNPTR)memFunc,
                     IARG_UINT32, encodeXMMRegW(ins,0),
                     IARG_MEMORYREAD_EA,
+										IARG_CONST_CONTEXT, IARG_INST_PTR,
                     IARG_END);
             totalInstructions++;
         } else {
@@ -2555,6 +2809,7 @@ VOID insertUnOpCall(INS ins, AFUNPTR memFunc, AFUNPTR regFunc)
                     (AFUNPTR)regFunc,
                     IARG_UINT32, encodeXMMRegW(ins,0),
                     IARG_UINT32, encodeXMMRegR(ins,0),
+									  IARG_CONST_CONTEXT, IARG_INST_PTR,
                     IARG_END);
             totalInstructions++;
         } else {
@@ -2685,7 +2940,7 @@ VOID handleInstruction(INS ins, VOID *)
             INS_InsertIfCall(ins, IPOINT_BEFORE, (AFUNPTR)shadowMem64IsValid,
                     IARG_MEMORYWRITE_EA, IARG_END);
             INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)shadowClearMem64,
-                    IARG_MEMORYWRITE_EA, IARG_END);
+                    IARG_INST_PTR, IARG_MEMORYWRITE_EA, IARG_END);
             // unoptimized version
             // (re-enable if you want ENABLE_OVERWRITE_LOGGING here)
             //INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)shadowMovToMem64,
@@ -3075,10 +3330,10 @@ void dumpRegisterValues(ostream &out)
     out << "REG,SHADOW0,SHADOW1,SHADOW2,SHADOW3" << endl;
     for (int i = 0; i < 16; i++) {
         out << "xmm" << i << ",";
-        SH_OUTPUT(out,xmm[XMM_SLOT(i,0)]); out << ",";
-        SH_OUTPUT(out,xmm[XMM_SLOT(i,1)]); out << ",";
-        SH_OUTPUT(out,xmm[XMM_SLOT(i,2)]); out << ",";
-        SH_OUTPUT(out,xmm[XMM_SLOT(i,3)]); out << ",";
+        SH_OUTPUT_WRAP(out,xmm[XMM_SLOT(i,0)],-1); out << ",";
+        SH_OUTPUT_WRAP(out,xmm[XMM_SLOT(i,1)],-1); out << ",";
+        SH_OUTPUT_WRAP(out,xmm[XMM_SLOT(i,2)],-1); out << ",";
+        SH_OUTPUT_WRAP(out,xmm[XMM_SLOT(i,3)],-1); out << ",";
         out << endl;
     }
 }
@@ -3089,15 +3344,69 @@ void dumpRegisterValues(ostream &out)
 void dumpMemValue(ostream &out, ADDRINT addr, double sys, const char *tag)
 {
     out.precision(20);  // print floating-point values with 20 decimal places
-    out << "0x" << std::hex << addr << std::dec
+    out << "M0x" << std::hex << addr << std::dec
         << "," << sys
         << ",";
     SH_OUTPUT(out, SHMEM_ACCESS(addr));
-    out.precision(4);   // print relative errors with 4 decimal places
-    out << "," << SH_RELERR(SHMEM_ACCESS(addr), sys)
-        << "," << tag
-        << endl;
+    out << "," ;
+		if (KnobTrackMemErrors.Value() == 1) {
+			for (auto const& err: memMapErrors[addr]) {
+				out << "0x" << std::hex << err.first << std::dec << ";";
+				out << err.second.first << ";";
+				out << err.second.second << ",";
+			}
+			out << endl;
+		} else {
+			out << SH_RELERR(SHMEM_ACCESS(addr), sys)
+			    << "," << tag << endl;
+		}
 }
+
+
+/*
+ * print an instruction error to the given output stream in CSV format
+ */
+void dumpInsValue(ostream &out, ADDRINT ins, const char *tag)
+{
+    out.precision(20);  // print floating-point values with 20 decimal places
+    out << "I0x" << std::hex << ins << std::dec;
+    out << "[";
+    out << insMapInfo[ins].img << ":";
+    out << insMapInfo[ins].func << ":";
+    out << insMapInfo[ins].filename << ":";
+    out << insMapInfo[ins].linenumber;
+    out << "]," ;
+
+    if (KnobTrackInsErrors.Value() == 1) {
+			for (auto const& err: insMapErrors[ins]) {
+				out << err.first << ";" << err.second << ",";
+			}
+			out << endl;
+    }
+}
+
+
+/*
+ *  * print an instruction/memory error to the given output stream in CSV format
+ *   */
+void dumpInsMemValue(ostream &out, ADDRINT ins, ADDRINT addr, double sys, const char *tag)
+{
+    out.precision(20);  // print floating-point values with 20 decimal places
+    out << "MI0x" << std::hex << ins << std::dec
+        << "," << std::hex << addr << std::dec
+				<< "," << sys
+        << ",";
+    SH_OUTPUT_WRAP(out, SHMEM_ACCESS(addr),addr);
+    out.precision(16);   // print relative errors with 4 decimal places
+    out << ",";
+    ins_t ins_data = insmemMap[std::make_pair(ins,addr)];
+    for (auto const& err: ins_data.errors) {
+   		out << err << ";";
+    }
+    out << "," << SH_RELERR(SHMEM_ACCESS(addr), sys)
+  	<< "," << ins_data.num_writes << endl;
+}
+
 
 /*
  * user-requested shadow value reporting (single value)
@@ -3134,56 +3443,108 @@ VOID reportShadowArray(ADDRINT loc, UINT64 size, ADDRINT tag)
  */
 void dumpMemoryValues(ostream &out, bool dumpAll)
 {
-    outFile << "===  MEMORY SHADOW VALUES ===" << endl;
-    outFile << "ADDR,SYSVAL,SHADOWVAL,RELERROR,TAG" << endl;
+   ADDRINT addr;
+   ADDRINT ins;
+   if (KnobTrackMemErrors.Value() == 1 && KnobTrackInsErrors.Value() == 1) {
+	    outFile << "===  INSTRUCTION MEMORY SHADOW VALUES ===" << endl;
+	    outFile << "INS,ADDR,SYSVAL,SHADOWVAL,RELERRORS,RELERR,WRITES" << endl;
 
-    ADDRINT addr;
-    SHMEM_FOR_EACH(addr)
+	    SHINSMEM_FOR_EACH(ins,addr)
+					// ignore stack locations (they're meaningless outside calling context)
+	        if (isStackAddr(addr)) {
+	            continue;
+	        }
 
-        // ignore stack locations (they're meaningless outside calling context)
-        if (isStackAddr(addr)) {
-            continue;
-        }
+	        int code = sigsetjmp(skip_point, 1);
+	        if (code == 0) {
 
-        int code = sigsetjmp(skip_point, 1);
-        if (code == 0) {
+	            signal(SIGSEGV, segfaultHandler);
+	            double sys = *(double*)addr;   // assumes original was 64 bits
+	            signal(SIGSEGV, SIG_DFL);
 
-            signal(SIGSEGV, segfaultHandler);
-            double sys = *(double*)addr;   // assumes original was 64 bits
-            signal(SIGSEGV, SIG_DFL);
+	            bool isError = SH_ISERR(SHMEM_ACCESS(addr), sys);
+	            if (dumpAll || isError) {
+	                dumpInsMemValue(out, ins, addr, sys, isError ? "ERROR" : "");
 
-            bool isError = SH_ISERR(SHMEM_ACCESS(addr), sys);
-            if (dumpAll || isError) {
+	                if (isError) {
+	                    double relerr = SH_RELERR(SHMEM_ACCESS(addr), sys);
+	                    finalErrorCount++;
+	                    finalAverageError += relerr;
+	                    if (relerr > finalMaxError) {
+	                        finalMaxError = relerr;
+	                    }
+	                }
+	            }
+	            finalShadowValueCount++;
 
-                dumpMemValue(out, addr, sys, isError ? "ERROR" : "");
+	        } else {
 
-                if (isError) {
-                    double relerr = SH_RELERR(SHMEM_ACCESS(addr), sys);
-                    finalErrorCount++;
-                    finalAverageError += relerr;
-                    if (relerr > finalMaxError) {
-                        finalMaxError = relerr;
-                    }
-                }
-            }
-            finalShadowValueCount++;
+	            // re-enable to get the actual segfaulting locations
+	            // (disabled because there could be quite a few)
+	            //
+	            //LOG("WARNING - could not report shadow value for location "
+	                    //+ hexstr(addr) + " (segfault)\n");
 
-        } else {
+	            finalSegfaultCount++;
+	        }
+	    }
 
-            // re-enable to get the actual segfaulting locations
-            // (disabled because there could be quite a few)
-            //
-            //LOG("WARNING - could not report shadow value for location "
-                    //+ hexstr(addr) + " (segfault)\n");
+   }
+   else if (KnobTrackInsErrors.Value() == 1) {
+	    outFile << "===  INSTRUCTION SHADOW VALUES ===" << endl;
+	    outFile << "INS,SYSVAL,SHADOWVAL,[ABSERR;RELERR]*" << endl;
+	  	SHINS_FOR_EACH(ins)
+				dumpInsValue(out,ins,"");
+			}
+   }
+   else {
+	    outFile << "===  MEMORY SHADOW VALUES ===" << endl;
+	    outFile << "ADDR,SYSVAL,SHADOWVAL,[INS;ABSERR;RELERR]*" << endl;
+		 	SHMEM_FOR_EACH(addr)
+				// ignore stack locations (they're meaningless outside calling context)
+				if (isStackAddr(addr)) {
+				    continue;
+				}
 
-            finalSegfaultCount++;
-        }
-    }
+				int code = sigsetjmp(skip_point, 1);
+				if (code == 0) {
+
+				    signal(SIGSEGV, segfaultHandler);
+				    double sys = *(double*)addr;   // assumes original was 64 bits
+				    signal(SIGSEGV, SIG_DFL);
+
+				    bool isError = SH_ISERR(SHMEM_ACCESS(addr), sys);
+				    if (dumpAll || isError) {
+				        dumpMemValue(out, addr, sys, isError ? "ERROR" : "");
+
+				        if (isError) {
+				            double relerr = SH_RELERR(SHMEM_ACCESS(addr), sys);
+				            finalErrorCount++;
+				            finalAverageError += relerr;
+				            if (relerr > finalMaxError) {
+				                finalMaxError = relerr;
+				            }
+				        }
+				    }
+				    finalShadowValueCount++;
+
+				} else {
+
+			    // re-enable to get the actual segfaulting locations
+			    // (disabled because there could be quite a few)
+			    //
+			    //LOG("WARNING - could not report shadow value for location "
+			            //+ hexstr(addr) + " (segfault)\n");
+
+			    finalSegfaultCount++;
+				}
+			}
+		}
 
     // calculate average relative error
-    if (finalErrorCount > 0) {
-        finalAverageError /= (double)finalErrorCount;
-    }
+   if (finalErrorCount > 0) {
+       finalAverageError /= (double)finalErrorCount;
+   }
 }
 
 /*
@@ -3288,6 +3649,7 @@ VOID handleCleanup(INT32 code, VOID *v)
     // finalize timer
     gettimeofday(&endTime, NULL);
 
+		reportShadowValues();
     // print and log a summary
     string summary = buildSummary();
     outFile << endl << summary;
@@ -3310,12 +3672,20 @@ int main(int argc, char* argv[])
 {
     // initialize Pin
     PIN_InitSymbols();  // we want symbol info if present
+    OS_MutexInit(&memMapStdMutex);
     if (PIN_Init(argc, argv)) {
         PIN_ERROR("This Pintool performs shadow value analysis on"
                   " floating-point arithmetic\n"
                 + KNOB_BASE::StringKnobSummary() + "\n");
         return -1;
     }
+
+		std::ifstream infile(KnobFunctionsFile.Value().c_str());
+    string func;
+    while (infile >> func) {
+   		functions.insert(func);
+    }
+    cout << "Read " << functions.size() << " functions" << endl;
 
     // initialize shadow value data type
     SH_INIT;
@@ -3356,4 +3726,3 @@ int main(int argc, char* argv[])
 
     return 0;
 }
-
